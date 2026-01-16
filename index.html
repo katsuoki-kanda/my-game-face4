@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Game Online - Pinocchio Fixed Edition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Arial', sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; object-fit: contain; transform: scaleX(-1); }
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; color: white; text-shadow: 2px 2px 4px #000;
+        }
+        .info-container {
+            position: absolute; top: 10px; left: 20px;
+            display: flex; flex-direction: column; gap: 5px;
+        }
+        .info { font-size: 36px; font-weight: bold; }
+        #score { color: #0f0; }
+        #timer { color: #f00; }
+        
+        #msg { 
+            position: absolute; top: 50%; left: 50%; 
+            transform: translate(-50%, -50%); 
+            font-size: 32px; text-align: center; color: #0f0;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+
+    <video id="input_video" style="display:none"></video>
+    <canvas id="output_canvas"></canvas>
+    
+    <div id="ui-layer">
+        <div class="info-container">
+            <div id="score" class="info">Score: 0</div>
+            <div id="timer" class="info">Time: 40</div>
+        </div>
+        <div id="msg">カメラを起動中...</div>
+    </div>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const scoreElement = document.getElementById('score');
+const timerElement = document.getElementById('timer');
+const msgElement = document.getElementById('msg');
+
+let score = 0;
+let gameStarted = false;
+let startTime = 0;
+const gameDuration = 40; 
+let countdown = gameDuration;
+
+let fpo1x = 0.5, fpo1y = 0.5; 
+let hiritu = 1.0;
+let currentCount = 1;
+let circles = [];
+const circleRadius = 50;
+const cursorRadius = 72;
+
+// 演出用変数
+let hitEffectTimer = 0;
+const hitEffectDuration = 5; // 約0.083秒 6で0.1秒 (60fps想定)
+
+let canScore = true;
+let hasClosedMouth = true;
+let isCoolDown = false;
+
+const speech = window.speechSynthesis;
+function speak(text) {
+    const uttr = new SpeechSynthesisUtterance(text);
+    uttr.lang = 'ja-JP';
+    speech.speak(uttr);
+}
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function beep() {
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(700, audioCtx.currentTime);
+    osc.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.1);
+}
+
+function initCircles() {
+    const positions = [
+        {x: 80, y: 80}, {x: 320, y: 80}, {x: 560, y: 80},
+        {x: 80, y: 240}, {x: 560, y: 240},
+        {x: 80, y: 400}, {x: 320, y: 400}, {x: 560, y: 400}
+    ];
+    let nums = [1, 2, 3, 4, 5, 6, 7, 8].sort(() => Math.random() - 0.5);
+    circles = positions.map((p, i) => ({
+        ...p,
+        num: nums[i],
+        active: true
+    }));
+}
+
+function onResults(results) {
+    canvasElement.width = videoElement.videoWidth;
+    canvasElement.height = videoElement.videoHeight;
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    if (results.faceLandmarks) {
+        const landmarks = results.faceLandmarks;
+        const w = canvasElement.width;
+        const h = canvasElement.height;
+
+        hiritu = (landmarks[199].y - landmarks[151].y) / 0.25;
+        const po1x = landmarks[1].x;
+        const po1y = landmarks[1].y;
+
+        const xx = 0.5 - (fpo1x - po1x) * 4; 
+        const relativeY = 0.5 - (fpo1y - po1y) * 6; 
+        const cursorX = xx * w;
+        const cursorY = relativeY * h;
+
+        let thresholdMultiplier = 0.015 - (Math.max(0, Math.min(1, relativeY)) * 0.008);
+        const mouthOpen = (landmarks[14].y - landmarks[13].y) > thresholdMultiplier * hiritu;
+
+        const distToCursor = Math.sqrt((cursorX - landmarks[1].x * w)**2 + (cursorY - landmarks[1].y * h)**2);
+        const isInsideRing = distToCursor < cursorRadius;
+
+        // --- 描画セクション ---
+        const lineWeight = Math.abs(landmarks[11].y - landmarks[12].y) * h;
+        canvasCtx.lineWidth = Math.max(1, lineWeight);
+        canvasCtx.strokeStyle = "red";
+
+        const noseBaseX = landmarks[4].x * w;
+        const noseBaseY = landmarks[4].y * h;
+        const noseWidth = Math.abs(landmarks[195].y - landmarks[94].y) * h;
+        const noseRadius = noseWidth / 2;
+
+        // 色の決定: ゲーム中かつ(口が開いているかヒット演出中)なら赤。それ以外は黄色。
+        const isRed = gameStarted && (mouthOpen || hitEffectTimer > 0);
+        canvasCtx.fillStyle = isRed ? "red" : "yellow";
+
+        if (!gameStarted || (isInsideRing && hitEffectTimer <= 0)) {
+            canvasCtx.beginPath();
+            canvasCtx.arc(noseBaseX, noseBaseY, noseRadius, 0, 2 * Math.PI);
+            canvasCtx.fill();
+        } else {
+            const angle = Math.atan2(cursorY - noseBaseY, cursorX - noseBaseX);
+            let baseLength = noseWidth * 2.5;
+            let distToTarget = Math.sqrt((cursorX - noseBaseX)**2 + (cursorY - noseBaseY)**2);
+            let currentNoseLength = baseLength;
+            
+            if (hitEffectTimer > 0) {
+                let progress = hitEffectTimer / hitEffectDuration;
+                currentNoseLength = baseLength + (distToTarget - baseLength) * progress;
+                hitEffectTimer--; 
+            }
+
+            canvasCtx.save();
+            canvasCtx.translate(noseBaseX, noseBaseY);
+            canvasCtx.rotate(angle);
+            canvasCtx.beginPath();
+            canvasCtx.moveTo(0, -noseWidth / 2);
+            canvasCtx.lineTo(currentNoseLength, 0);
+            canvasCtx.lineTo(0, noseWidth / 2);
+            canvasCtx.closePath();
+            canvasCtx.fill();
+            canvasCtx.restore();
+        }
+
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(landmarks[74].x * w, landmarks[74].y * h);
+        canvasCtx.lineTo(landmarks[304].x * w, landmarks[304].y * h);
+        canvasCtx.stroke();
+
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(landmarks[181].x * w, landmarks[181].y * h);
+        canvasCtx.lineTo(landmarks[405].x * w, landmarks[405].y * h);
+        canvasCtx.stroke();
+
+        // --- ゲームロジック ---
+        if (!mouthOpen) {
+            canScore = true;
+            hasClosedMouth = true;
+        }
+
+        if (!gameStarted) {
+            if (isCoolDown) {
+                msgElement.innerText = "終了！ スコア: " + score + "\n少々お待ちください...";
+            } else if (!hasClosedMouth) {
+                msgElement.innerText = "一度口を閉じてください";
+            } else {
+                msgElement.innerText = "口を開けてスタート！\n(終了はEscキー)";
+                if (mouthOpen) {
+                    fpo1x = landmarks[1].x;
+                    fpo1y = landmarks[1].y;
+                    gameStarted = true;
+                    startTime = Date.now();
+                    score = 0;
+                    currentCount = 1;
+                    canScore = false; 
+                    hitEffectTimer = 0;
+                    initCircles();
+                    speak("スタート");
+                    scoreElement.innerText = `Score: 0`;
+                }
+            }
+        } else {
+            msgElement.innerText = "";
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            countdown = Math.max(0, gameDuration - elapsed);
+            timerElement.innerText = `Time: ${countdown}`;
+
+            if (countdown <= 0) {
+                gameStarted = false;
+                hasClosedMouth = false;
+                isCoolDown = true;
+                hitEffectTimer = 0; // 終了時に演出リセット
+                speak(score + "点です。終了");
+                setTimeout(() => { isCoolDown = false; }, 3000);
+            }
+
+            circles.forEach(c => {
+                if (!c.active) return;
+                canvasCtx.save();
+                canvasCtx.globalAlpha = 0.9; 
+                canvasCtx.beginPath();
+                canvasCtx.arc(c.x, c.y, circleRadius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = "rgb(255, 0, 0)";
+                canvasCtx.fill();
+                
+                canvasCtx.save();
+                canvasCtx.scale(-1, 1); 
+                canvasCtx.fillStyle = "white";
+                canvasCtx.font = "bold 60px Arial";
+                canvasCtx.textAlign = "center";
+                canvasCtx.textBaseline = "middle";
+                canvasCtx.fillText(c.num, -c.x, c.y);
+                canvasCtx.restore();
+                canvasCtx.restore();
+
+                const dist = Math.sqrt((cursorX - c.x)**2 + (cursorY - c.y)**2);
+                if (dist < circleRadius && mouthOpen && canScore && c.num === currentCount) {
+                    c.active = false;
+                    score++;
+                    currentCount++;
+                    canScore = false; 
+                    scoreElement.innerText = `Score: ${score}`;
+                    beep();
+                    hitEffectTimer = hitEffectDuration;
+                }
+            });
+
+            if (currentCount > 8) {
+                initCircles();
+                currentCount = 1;
+            }
+
+            canvasCtx.beginPath();
+            canvasCtx.arc(cursorX, cursorY, cursorRadius, 0, 2 * Math.PI);
+            canvasCtx.strokeStyle = mouthOpen ? "#FF69B4" : "#00FF00"; 
+            canvasCtx.lineWidth = 6;
+            canvasCtx.stroke();
+        }
+    } else {
+        if (gameStarted) {
+            msgElement.innerText = "顔が見つかりません";
+        }
+    }
+    canvasCtx.restore();
+}
+
+const holistic = new Holistic({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`
+});
+
+holistic.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+});
+
+holistic.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => {
+        await holistic.send({image: videoElement});
+    },
+    width: 640,
+    height: 480
+});
+camera.start();
+
+window.addEventListener('keydown', (e) => {
+    if (e.key === "Escape") {
+        gameStarted = false;
+        speak("最初から");
+        location.reload();
+    }
+});
+</script>
+</body>
+</html>
